@@ -1,0 +1,46 @@
+# datafusion-opensearch — a DataFusion TableProvider over OpenSearch (and Elasticsearch).
+#
+# Query an index as a DataFusion table: `SELECT … FROM idx WHERE …` is planned by DataFusion and
+# executed as an OpenSearch `_search`, with the WHERE pushed into the query DSL, the projection into
+# `_source`, and LIMIT into `size`. Filters that cannot be translated exactly are left for
+# DataFusion to apply, so partial pushdown is always correct.
+#
+# Standalone and dependency-lean (datafusion, reqwest/rustls, serde_json). Package metadata is
+# pinned here rather than inherited from a workspace so the crate publishes unchanged from its own
+# repository.
+[package]
+name = "datafusion-opensearch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "A DataFusion TableProvider over OpenSearch/Elasticsearch with filter, projection and limit pushdown."
+repository = "https://github.com/FusionVault/datafusion-opensearch"
+readme = "README.md"
+keywords = ["datafusion", "opensearch", "elasticsearch", "arrow", "tableprovider"]
+categories = ["database"]
+
+[dependencies]
+# Tracks the DataFusion major line; bump the major together with DataFusion.
+datafusion = "54"
+async-trait = "0.1"
+# rustls-only, JSON — no native TLS / openssl.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+snafu = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Integration tests run a real OpenSearch container (`cargo test -- --ignored`).
+testcontainers = "0.27"
+
+[features]
+default = []
+# Scalar UDFs that carry OpenSearch-native predicates (`match`, geo bounding box / distance /
+# polygon) through the planner so the provider pushes them down as native queries.
+udf = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

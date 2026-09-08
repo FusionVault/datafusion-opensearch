@@ -1,0 +1,61 @@
+# CI for datafusion-opensearch (this file is inert inside the nexus monorepo — GitHub only runs
+# workflows from the repository root — and becomes live once the crate is split into its own repo).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: build · test · clippy · doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: build (no features)
+        run: cargo build
+      - name: build (all features)
+        run: cargo build --all-features
+      - name: test (no features)
+        run: cargo test
+      - name: test (all features)
+        run: cargo test --all-features
+      - name: clippy (no features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: doc
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  integration:
+    name: end-to-end vs real OpenSearch (testcontainers)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: testcontainers e2e
+        run: cargo test --all-features --test testcontainers -- --ignored --nocapture
+
+  publish-dry-run:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --dry-run
