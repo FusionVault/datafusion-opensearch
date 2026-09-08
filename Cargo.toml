@@ -12,13 +12,15 @@
 name = "datafusion-opensearch"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "A DataFusion TableProvider over OpenSearch/Elasticsearch with filter, projection and limit pushdown."
 repository = "https://github.com/FusionVault/datafusion-opensearch"
 readme = "README.md"
 keywords = ["datafusion", "opensearch", "elasticsearch", "arrow", "tableprovider"]
 categories = ["database"]
+# Repo tooling that has no place in the published crate.
+exclude = [".github/", ".gitignore", "rustfmt.toml"]
 
 [dependencies]
 # Tracks the DataFusion major line; bump the major together with DataFusion.
