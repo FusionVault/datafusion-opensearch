@@ -44,3 +44,10 @@ udf = []
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# Dev/test builds: line-tables-only debug info. The DataFusion dependency graph with full DWARF
+# links to ~1 GB per test binary and exhausts CI runners (observed: `ld … signal 7 [Bus error]`
+# linking the testcontainers test). file:line in panics/backtraces is kept; step-debugger locals
+# are not — override locally with `debug = true` if you need them.
+[profile.dev]
+debug = "line-tables-only"

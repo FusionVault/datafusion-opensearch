@@ -10,6 +10,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Two heavy test binaries linking at once doubles peak memory on a 7 GB runner.
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   check:
@@ -17,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: free runner disk (the DataFusion dep graph needs the headroom)
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup && df -h / | tail -1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -46,6 +50,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
+      - name: free runner disk (the DataFusion dep graph needs the headroom)
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup && df -h / | tail -1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: testcontainers e2e
