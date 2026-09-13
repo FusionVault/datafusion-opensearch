@@ -2,21 +2,24 @@
 #
 # Query an index as a DataFusion table: `SELECT … FROM idx WHERE …` is planned by DataFusion and
 # executed as an OpenSearch `_search`, with the WHERE pushed into the query DSL, the projection into
-# `_source`, and LIMIT into `size`. Filters that cannot be translated exactly are left for
-# DataFusion to apply, so partial pushdown is always correct.
+# `_source`, and LIMIT into the page size; results stream page by page through a scroll cursor.
+# Filters that cannot be translated exactly are left for DataFusion to apply, so partial pushdown is
+# always correct. `CREATE EXTERNAL TABLE … STORED AS OPENSEARCH` and a schema provider that lists a
+# cluster's indices make it reachable from SQL alone.
 #
 # Standalone and dependency-lean (datafusion, reqwest/rustls, serde_json). Package metadata is
 # pinned here rather than inherited from a workspace so the crate publishes unchanged from its own
 # repository.
 [package]
 name = "datafusion-opensearch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 description = "A DataFusion TableProvider over OpenSearch/Elasticsearch with filter, projection and limit pushdown."
 repository = "https://github.com/FusionVault/datafusion-opensearch"
 readme = "README.md"
+documentation = "https://docs.rs/datafusion-opensearch"
 keywords = ["datafusion", "opensearch", "elasticsearch", "arrow", "tableprovider"]
 categories = ["database"]
 # Repo tooling that has no place in the published crate.
@@ -26,6 +29,7 @@ exclude = [".github/", ".gitignore", "rustfmt.toml"]
 # Tracks the DataFusion major line; bump the major together with DataFusion.
 datafusion = "54"
 async-trait = "0.1"
+futures = "0.3"
 # rustls-only, JSON — no native TLS / openssl.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"

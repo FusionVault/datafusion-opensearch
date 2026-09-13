@@ -10,10 +10,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::arrow::array::{Array, StringArray};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::prelude::SessionContext;
+use datafusion::arrow::array::{Array, StringArray, StringViewArray};
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::catalog::SchemaProvider;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_opensearch::{OpenSearchClient, OpenSearchTableFactory};
+use datafusion_opensearch::{OpenSearchSchemaProvider, OpenSearchTableProviderFactory};
 use serde_json::json;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
@@ -42,12 +44,19 @@ async fn wait_healthy(http: &reqwest::Client, url: &str) {
     }
 }
 
-/// Collect one Utf8 column across all batches, sorted.
+/// Collect one string column (Utf8 or Utf8View — SQL `VARCHAR` plans as the latter) across all
+/// batches, sorted.
 fn strings(batches: &[datafusion::arrow::record_batch::RecordBatch], col: usize) -> Vec<String> {
     let mut out = vec![];
     for b in batches {
-        let a = b.column(col).as_any().downcast_ref::<StringArray>().unwrap();
-        out.extend((0..a.len()).filter(|&i| !a.is_null(i)).map(|i| a.value(i).to_string()));
+        let c = b.column(col);
+        if let Some(a) = c.as_any().downcast_ref::<StringArray>() {
+            out.extend((0..a.len()).filter(|&i| !a.is_null(i)).map(|i| a.value(i).to_string()));
+        } else if let Some(a) = c.as_any().downcast_ref::<StringViewArray>() {
+            out.extend((0..a.len()).filter(|&i| !a.is_null(i)).map(|i| a.value(i).to_string()));
+        } else {
+            panic!("column {col} is not a string column: {:?}", c.data_type());
+        }
     }
     out.sort();
     out
@@ -81,6 +90,7 @@ async fn end_to_end_against_a_real_opensearch() {
             "active": { "type": "boolean" },
             "title": { "type": "text" },
             "pos": { "type": "geo_point" },
+            "when": { "type": "date" },
         } } }))
         .send()
         .await
@@ -88,10 +98,10 @@ async fn end_to_end_against_a_real_opensearch() {
         .error_for_status()
         .unwrap();
     let docs = [
-        json!({ "id": "a", "status": "OK",   "speed": 55.0, "count": 1, "active": true,  "title": "engine fault cleared",  "pos": { "lat": 60.17, "lon": 24.94 } }), // Helsinki
-        json!({ "id": "b", "status": "OK",   "speed": 30.0, "count": 2, "active": false, "title": "routine service",        "pos": { "lat": 59.33, "lon": 18.07 } }), // Stockholm
-        json!({ "id": "c", "status": "DOWN", "speed": 70.0, "count": 3, "active": true,  "title": "engine overheating",     "pos": { "lat": 55.68, "lon": 12.57 } }), // Copenhagen
-        json!({ "id": "d", "status": "OK",   "speed": 45.0, "count": 4, "active": true,  "title": "brakes worn",            "pos": { "lat": 59.91, "lon": 10.75 } }), // Oslo
+        json!({ "id": "a", "status": "OK",   "speed": 55.0, "count": 1, "active": true,  "title": "engine fault cleared",  "pos": { "lat": 60.17, "lon": 24.94 }, "when": "2024-01-01T10:00:00Z" }), // Helsinki
+        json!({ "id": "b", "status": "OK",   "speed": 30.0, "count": 2, "active": false, "title": "routine service",        "pos": { "lat": 59.33, "lon": 18.07 }, "when": "2024-01-02T10:00:00Z" }), // Stockholm
+        json!({ "id": "c", "status": "DOWN", "speed": 70.0, "count": 3, "active": true,  "title": "engine overheating",     "pos": { "lat": 55.68, "lon": 12.57 }, "when": "2024-01-03T10:00:00Z" }), // Copenhagen
+        json!({ "id": "d", "status": "OK",   "speed": 45.0, "count": 4, "active": true,  "title": "brakes worn",            "pos": { "lat": 59.91, "lon": 10.75 }, "when": 1_704_362_400_000_i64 }), // Oslo, epoch millis = 2024-01-04T10:00:00Z
     ];
     for d in &docs {
         http.put(format!("{url}/{INDEX}/_doc/{}?refresh=true", d["id"].as_str().unwrap()))
@@ -122,6 +132,10 @@ async fn end_to_end_against_a_real_opensearch() {
             ("speed".into(), DataType::Float64),
             ("status".into(), DataType::Utf8),
             ("title".into(), DataType::Utf8),
+            (
+                "when".into(),
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+            ),
         ]
     );
     let ctx = SessionContext::new();
@@ -177,7 +191,208 @@ async fn end_to_end_against_a_real_opensearch() {
         "base filter ANDs with the user predicate"
     );
 
-    // ── 4) native match + geo pushdown (feature `udf`) ──
+    // ── 4) timestamps: read from ISO strings and epoch millis; range pushed as epoch millis ──
+    let batches = ctx
+        .sql("SELECT id FROM t WHERE \"when\" >= '2024-01-03T00:00:00Z'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&batches, 0),
+        vec!["c", "d"],
+        "date range pushed as epoch millis"
+    );
+    let batches = ctx
+        .sql("SELECT id FROM t WHERE \"when\" BETWEEN '2024-01-02' AND '2024-01-02T23:59:59Z'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(strings(&batches, 0), vec!["b"]);
+
+    // ── 5) streaming: a result larger than one page comes back complete, LIMIT stops early ──
+    let big = format!("{INDEX}-paging");
+    http.put(format!("{url}/{big}"))
+        .json(&json!({ "mappings": { "properties": { "n": { "type": "integer" } } } }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut bulk = String::new();
+    for n in 0..23 {
+        bulk.push_str(&format!("{{\"index\":{{\"_id\":\"{n}\"}}}}\n{{\"n\":{n}}}\n"));
+    }
+    http.post(format!("{url}/{big}/_bulk?refresh=true"))
+        .header("content-type", "application/x-ndjson")
+        .body(bulk)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let paged = factory.provider(&big).await.unwrap().with_page_size(5);
+    let ctx3 = SessionContext::new();
+    ctx3.register_table("p", Arc::new(paged)).unwrap();
+    let batches = ctx3.sql("SELECT n FROM p").await.unwrap().collect().await.unwrap();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 23, "every page of a 23-row result with page_size 5");
+    assert!(batches.len() >= 5, "streamed as pages, got {} batches", batches.len());
+    let n: usize = ctx3
+        .sql("SELECT n FROM p LIMIT 7")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(n, 7, "LIMIT stops the scroll after two pages");
+    let capped = factory
+        .provider(&big)
+        .await
+        .unwrap()
+        .with_page_size(5)
+        .with_max_rows(Some(12));
+    ctx3.register_table("capped", Arc::new(capped)).unwrap();
+    let n: usize = ctx3
+        .sql("SELECT n FROM capped")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(n, 12, "max_rows caps a LIMIT-less scan");
+    // Partitioned: three sliced scrolls in parallel still return every row exactly once.
+    let sliced = factory
+        .provider(&big)
+        .await
+        .unwrap()
+        .with_page_size(4)
+        .with_partitions(3);
+    ctx3.register_table("sliced", Arc::new(sliced)).unwrap();
+    let batches = ctx3.sql("SELECT n FROM sliced").await.unwrap().collect().await.unwrap();
+    let mut seen: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let a = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap();
+            (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        (0..23).collect::<Vec<i64>>(),
+        "sliced scroll covers every row once"
+    );
+    let n: usize = ctx3
+        .sql("SELECT n FROM sliced LIMIT 5")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(n, 5, "a LIMIT on a partitioned table is exact (single partition)");
+    let plan = ctx3
+        .sql("EXPLAIN SELECT n FROM sliced")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(
+        strings(&plan, 1).iter().any(|l| l.contains("partitions=3")),
+        "EXPLAIN shows the operator"
+    );
+
+    let total: i64 = {
+        let b = ctx3.sql("SELECT sum(n) FROM p").await.unwrap().collect().await.unwrap();
+        b[0].column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(total, (0..23).sum::<i64>(), "aggregation over a streamed scan");
+
+    // ── 6) CREATE EXTERNAL TABLE … STORED AS OPENSEARCH ──
+    // information_schema on, so SHOW TABLES works in step 7.
+    let ctx4 = SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
+    OpenSearchTableProviderFactory::new().register(&ctx4);
+    ctx4.sql(&format!(
+        "CREATE EXTERNAL TABLE docs STORED AS OPENSEARCH LOCATION '{url}/{INDEX}' \
+         OPTIONS ('sort' 'speed:desc', 'base_filter' '[{{\"term\":{{\"status\":\"OK\"}}}}]')"
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let batches = ctx4
+        .sql("SELECT id FROM docs LIMIT 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&batches, 0),
+        vec!["a", "d"],
+        "top-2 by speed among OK rows: a (55), d (45)"
+    );
+    ctx4.sql(&format!(
+        "CREATE EXTERNAL TABLE typed (id VARCHAR, speed DOUBLE) STORED AS OPENSEARCH LOCATION '{url}/{INDEX}'"
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let batches = ctx4
+        .sql("SELECT id FROM typed WHERE speed < 40")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(strings(&batches, 0), vec!["b"]);
+
+    // ── 7) the cluster as a schema: SHOW TABLES lists the indices, tables build lazily ──
+    let os = OpenSearchSchemaProvider::connect(OpenSearchClient::new(&url))
+        .await
+        .unwrap();
+    assert!(os.table_exist(INDEX) && os.table_exist(&big));
+    ctx4.catalog("datafusion")
+        .unwrap()
+        .register_schema("os", Arc::new(os))
+        .unwrap();
+    let batches = ctx4
+        .sql(&format!("SELECT id FROM os.\"{INDEX}\" WHERE status = 'DOWN'"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(strings(&batches, 0), vec!["c"]);
+    let names = strings(&ctx4.sql("SHOW TABLES").await.unwrap().collect().await.unwrap(), 2);
+    assert!(names.contains(&INDEX.to_string()) && names.contains(&big), "{names:?}");
+    http.delete(format!("{url}/{big}")).send().await.unwrap();
+
+    // ── 8) native match + geo pushdown (feature `udf`) ──
     #[cfg(feature = "udf")]
     {
         for f in datafusion_opensearch::udf::all_udfs() {

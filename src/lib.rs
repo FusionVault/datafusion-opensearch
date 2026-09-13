@@ -2,34 +2,32 @@
 //!
 //! `SELECT … FROM <index> WHERE …` planned by DataFusion becomes an OpenSearch `_search`: the
 //! WHERE is pushed into the query DSL ([`pushdown::expr_to_query`]), the projection into
-//! `_source`, and the LIMIT into `size`. Filters that cannot be translated exactly are reported
+//! `_source`, and the LIMIT into the page size. The result is **streamed page by page** through a
+//! scroll cursor ([`OpenSearchExec`]), so a scan is complete at any index size with memory bounded
+//! by the page size. Filters that cannot be translated exactly are reported
 //! [`TableProviderFilterPushDown::Unsupported`], so DataFusion re-applies them in-memory — partial
 //! pushdown is therefore always correct and never widens the result set.
 //!
-//! Two ways to build a table:
+//! Three ways in:
 //!
-//! - [`OpenSearchTableProvider::new`] with a declared Arrow schema (only the listed columns are read).
-//! - [`OpenSearchTableFactory::table_provider`], which derives the schema from the index `_mapping`
-//!   ([`schema::schema_from_mapping`]).
+//! - SQL only: register [`OpenSearchTableProviderFactory`] and
+//!   `CREATE EXTERNAL TABLE docs STORED AS OPENSEARCH LOCATION 'http://localhost:9200/my-index'`.
+//! - A whole cluster: [`OpenSearchSchemaProvider`] lists every index as a table (`SHOW TABLES`).
+//! - One index: [`OpenSearchTableFactory::table_provider`] (schema from the `_mapping`) or
+//!   [`OpenSearchTableProvider::new`] with a declared Arrow schema.
 //!
 //! ```no_run
-//! use std::sync::Arc;
-//! use datafusion::arrow::datatypes::{DataType, Field, Schema};
 //! use datafusion::prelude::SessionContext;
-//! use datafusion_opensearch::OpenSearchTableProvider;
+//! use datafusion_opensearch::OpenSearchTableProviderFactory;
 //!
 //! # async fn run() -> datafusion::error::Result<()> {
-//! let schema = Arc::new(Schema::new(vec![
-//!     Field::new("id", DataType::Utf8, true),
-//!     Field::new("status", DataType::Utf8, true),
-//! ]));
 //! let ctx = SessionContext::new();
-//! ctx.register_table(
-//!     "docs",
-//!     Arc::new(OpenSearchTableProvider::new("http://localhost:9200", "my-index", schema)),
-//! )?;
-//! let df = ctx.sql("SELECT id FROM docs WHERE status = 'OK' LIMIT 10").await?;
-//! df.show().await?;
+//! OpenSearchTableProviderFactory::new().register(&ctx);
+//! ctx.sql("CREATE EXTERNAL TABLE docs STORED AS OPENSEARCH LOCATION 'http://localhost:9200/my-index'")
+//!     .await?
+//!     .collect()
+//!     .await?;
+//! ctx.sql("SELECT id, status FROM docs WHERE speed > 40 AND status = 'OK' LIMIT 100").await?.show().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -41,16 +39,27 @@
 //! [`TableProvider`]: datafusion::catalog::TableProvider
 //! [`TableProviderFilterPushDown::Unsupported`]: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported
 
+/// Every Rust code block in the README is compiled as a doctest (`no_run`: they need a server).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
+pub mod catalog;
 pub mod client;
+pub mod exec;
 pub mod pushdown;
 pub mod schema;
 pub mod table;
 #[cfg(feature = "udf")]
 pub mod udf;
 
-pub use client::OpenSearchClient;
+pub use catalog::OpenSearchSchemaProvider;
+pub use client::{OpenSearchClient, SearchPage};
+pub use exec::OpenSearchExec;
 pub use schema::schema_from_mapping;
-pub use table::{OpenSearchTableFactory, OpenSearchTableProvider, DEFAULT_SIZE};
+pub use table::{
+    OpenSearchTableFactory, OpenSearchTableProvider, OpenSearchTableProviderFactory, DEFAULT_PAGE_SIZE, FILE_TYPE,
+};
 #[cfg(feature = "udf")]
 pub use udf::{
     os_geo_bbox_udf, os_geo_distance_udf, os_geo_polygon_udf, os_match_udf, OS_GEO_BBOX, OS_GEO_DISTANCE,

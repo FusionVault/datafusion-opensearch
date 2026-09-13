@@ -3,8 +3,18 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use std::str::FromStr;
+
+use datafusion::arrow::array::timezone::Tz;
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, Float32Array, Float64Array, LargeStringArray, PrimitiveArray, StringArray, StringViewArray,
+    TimestampMillisecondArray,
+};
+use datafusion::arrow::compute::kernels::cast_utils::string_to_datetime;
+use datafusion::arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, SchemaRef, TimeUnit,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use serde_json::Value;
@@ -19,13 +29,14 @@ use serde_json::Value;
 ///
 /// | OpenSearch | Arrow |
 /// |---|---|
-/// | `keyword`, `text`, `wildcard`, `constant_keyword`, `ip`, `date`, `date_nanos` | `Utf8` |
+/// | `keyword`, `text`, `wildcard`, `constant_keyword`, `ip` | `Utf8` |
+/// | `date`, `date_nanos` | `Timestamp(Millisecond, UTC)` |
 /// | `long`, `integer`, `short`, `byte`, `unsigned_long` | `Int64` |
 /// | `double`, `float`, `half_float`, `scaled_float` | `Float64` |
 /// | `boolean` | `Boolean` |
 /// | `object`, `nested`, `geo_point`, `geo_shape`, anything else | `Utf8` (the value's JSON text) |
 ///
-/// Only `Utf8` / `Int64` / `Float64` / `Boolean` columns are materialised (see [`build_batch`]), so
+/// Only `Utf8` / `Int64` / `Float64` / `Boolean` / `Timestamp(Millisecond)` columns are materialised (see [`build_batch`]), so
 /// every mapping type is readable — structured and unknown types arrive as JSON text to parse
 /// downstream. Every field is nullable: documents routinely omit fields. Returns `None` when no
 /// `properties` can be found.
@@ -57,7 +68,8 @@ fn arrow_type_for(os_type: Option<&str>) -> DataType {
         Some("long" | "integer" | "short" | "byte" | "unsigned_long") => DataType::Int64,
         Some("double" | "float" | "half_float" | "scaled_float") => DataType::Float64,
         Some("boolean") => DataType::Boolean,
-        // text-like, temporal (ISO strings), structured, geo, and unknown → text.
+        Some("date" | "date_nanos") => DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        // text-like, structured, geo, and unknown → text.
         _ => DataType::Utf8,
     }
 }
@@ -65,51 +77,52 @@ fn arrow_type_for(os_type: Option<&str>) -> DataType {
 /// Build a `RecordBatch` for `schema` from `_source` objects, reading each field by name and
 /// coercing to the declared Arrow type. Absent, null, or type-mismatched values become nulls.
 ///
-/// Coercions: a `Utf8` column reads a string as-is and any other non-null JSON value (object,
-/// array, number, bool) as its compact JSON text; an `Int64` column also accepts a whole-valued
-/// float (`106.0`), which OpenSearch/JSON commonly store for integer fields.
+/// Supported column types: `Utf8` / `LargeUtf8` / `Utf8View` (a string as-is, any other non-null
+/// JSON value as its compact JSON text), every integer width `Int8`…`Int64` / `UInt8`…`UInt64`
+/// (a whole-valued float such as `106.0` is accepted; out-of-range values become null), `Float32`
+/// / `Float64`, `Boolean`, and `Timestamp(Millisecond, _)` (an ISO 8601 / RFC 3339 string or an
+/// epoch-milliseconds number — the two shapes OpenSearch's default `date` format accepts).
 pub fn build_batch(schema: &SchemaRef, sources: &[Value]) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         let name = field.name();
+        let values = sources.iter().map(|s| s.get(name));
         let col: ArrayRef = match field.data_type() {
-            DataType::Utf8 => {
-                let mut b = StringBuilder::new();
-                for s in sources {
-                    b.append_option(match s.get(name) {
-                        None | Some(Value::Null) => None,
-                        Some(Value::String(s)) => Some(s.clone()),
-                        Some(other) => Some(other.to_string()),
-                    });
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Int64 => {
-                let mut b = Int64Builder::new();
-                for s in sources {
-                    b.append_option(s.get(name).and_then(|v| {
-                        v.as_i64().or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && f.is_finite()).map(|f| f as i64))
-                    }));
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Float64 => {
-                let mut b = Float64Builder::new();
-                for s in sources {
-                    b.append_option(s.get(name).and_then(Value::as_f64));
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Boolean => {
-                let mut b = BooleanBuilder::new();
-                for s in sources {
-                    b.append_option(s.get(name).and_then(Value::as_bool));
-                }
-                Arc::new(b.finish())
+            DataType::Utf8 => Arc::new(values.map(json_text).collect::<StringArray>()),
+            DataType::LargeUtf8 => Arc::new(values.map(json_text).collect::<LargeStringArray>()),
+            DataType::Utf8View => Arc::new(values.map(json_text).collect::<StringViewArray>()),
+            DataType::Int8 => int_column::<Int8Type>(values),
+            DataType::Int16 => int_column::<Int16Type>(values),
+            DataType::Int32 => int_column::<Int32Type>(values),
+            DataType::Int64 => int_column::<Int64Type>(values),
+            DataType::UInt8 => int_column::<UInt8Type>(values),
+            DataType::UInt16 => int_column::<UInt16Type>(values),
+            DataType::UInt32 => int_column::<UInt32Type>(values),
+            DataType::UInt64 => int_column::<UInt64Type>(values),
+            DataType::Float32 => Arc::new(
+                values
+                    .map(|v| v.and_then(Value::as_f64).map(|f| f as f32))
+                    .collect::<Float32Array>(),
+            ),
+            DataType::Float64 => Arc::new(values.map(|v| v.and_then(Value::as_f64)).collect::<Float64Array>()),
+            DataType::Boolean => Arc::new(values.map(|v| v.and_then(Value::as_bool)).collect::<BooleanArray>()),
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                let utc = Tz::from_str("UTC").expect("UTC is a valid timezone");
+                let millis = values.map(|v| match v {
+                    Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+                    Some(Value::String(text)) => string_to_datetime(&utc, text).ok().map(|dt| dt.timestamp_millis()),
+                    _ => None,
+                });
+                Arc::new(
+                    millis
+                        .collect::<TimestampMillisecondArray>()
+                        .with_timezone_opt(tz.clone()),
+                )
             }
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
-                    "datafusion-opensearch: column '{name}' has unsupported type {other:?} (Utf8/Int64/Float64/Boolean only)"
+                    "datafusion-opensearch: column '{name}' has unsupported type {other:?} \
+                     (string, integer, float, Boolean and Timestamp(Millisecond) columns only)"
                 )))
             }
         };
@@ -118,11 +131,42 @@ pub fn build_batch(schema: &SchemaRef, sources: &[Value]) -> Result<RecordBatch>
     RecordBatch::try_new(schema.clone(), columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
+/// A JSON value as text: strings as-is, anything else non-null as compact JSON.
+fn json_text(v: Option<&Value>) -> Option<String> {
+    match v {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// A JSON number as an integer: integers as-is, whole-valued finite floats converted, anything
+/// out of the target range → null.
+fn int_column<'a, T>(values: impl Iterator<Item = Option<&'a Value>>) -> ArrayRef
+where
+    T: ArrowPrimitiveType,
+    T::Native: TryFrom<i64>,
+{
+    Arc::new(
+        values
+            .map(|v| {
+                let n = v.and_then(|v| {
+                    v.as_i64().or_else(|| {
+                        v.as_f64()
+                            .filter(|f| f.fract() == 0.0 && f.is_finite())
+                            .map(|f| f as i64)
+                    })
+                })?;
+                T::Native::try_from(n).ok()
+            })
+            .collect::<PrimitiveArray<T>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::TimeUnit;
     use serde_json::json;
 
     fn schema() -> SchemaRef {
@@ -163,7 +207,10 @@ mod tests {
                 ("name".into(), DataType::Utf8),
                 ("odd".into(), DataType::Utf8), // unknown → text
                 ("ratio".into(), DataType::Float64),
-                ("when".into(), DataType::Utf8),  // date → ISO text
+                (
+                    "when".into(),
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+                ),
                 ("where".into(), DataType::Utf8), // geo_point → JSON text
             ]
         );
@@ -251,12 +298,73 @@ mod tests {
     }
 
     #[test]
-    fn build_batch_rejects_unsupported_column_type() {
+    fn build_batch_reads_timestamps_from_iso_strings_and_epoch_millis() {
+        use datafusion::arrow::array::TimestampMillisecondArray;
         let s = Arc::new(Schema::new(vec![Field::new(
             "t",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
             true,
         )]));
+        let b = build_batch(
+            &s,
+            &[
+                json!({ "t": "2024-01-02T03:04:05Z" }),
+                json!({ "t": "2024-01-02T03:04:05.678+02:00" }),
+                json!({ "t": 1_704_164_645_000_i64 }),
+                json!({ "t": "2024-01-02" }),
+                json!({ "t": "not a date" }),
+                json!({}),
+            ],
+        )
+        .unwrap();
+        let t = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(t.value(0), 1_704_164_645_000);
+        assert_eq!(t.value(1), 1_704_164_645_678 - 2 * 3_600_000);
+        assert_eq!(t.value(2), 1_704_164_645_000);
+        assert_eq!(t.value(3), 1_704_153_600_000);
+        assert!(t.is_null(4) && t.is_null(5));
+    }
+
+    #[test]
+    fn build_batch_materialises_every_declared_width_and_string_flavour() {
+        use datafusion::arrow::array::{Int32Array, StringViewArray, UInt8Array};
+        let s = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8View, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("u8", DataType::UInt8, true),
+            Field::new("f32", DataType::Float32, true),
+        ]));
+        let b = build_batch(
+            &s,
+            &[
+                json!({ "v": "x", "i32": 7, "u8": 255, "f32": 1.5 }),
+                json!({ "v": { "k": 1 }, "i32": 3_000_000_000_i64, "u8": -1, "f32": 2 }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            b.column(0).as_any().downcast_ref::<StringViewArray>().unwrap().value(1),
+            "{\"k\":1}"
+        );
+        let i = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(i.value(0), 7);
+        assert!(i.is_null(1), "out of range → null");
+        let u = b.column(2).as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(u.value(0), 255);
+        assert!(u.is_null(1), "negative → null");
+        assert_eq!(
+            b.column(3).as_any().downcast_ref::<Float32Array>().unwrap().value(1),
+            2.0
+        );
+    }
+
+    #[test]
+    fn build_batch_rejects_unsupported_column_type() {
+        let s = Arc::new(Schema::new(vec![Field::new("t", DataType::Date32, true)]));
         let err = build_batch(&s, &[json!({ "t": 1 })]).unwrap_err();
         assert!(matches!(err, DataFusionError::NotImplemented(_)));
     }

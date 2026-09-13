@@ -44,7 +44,14 @@ fn scalar_to_json(sv: &ScalarValue) -> Option<Value> {
         ScalarValue::UInt64(Some(n)) => Some(json!(n)),
         ScalarValue::Float32(Some(f)) => Some(json!(f)),
         ScalarValue::Float64(Some(f)) => Some(json!(f)),
-        _ => None, // NULLs, temporal/decimal/nested types → let DataFusion handle it
+        // Temporal literals → epoch milliseconds, which OpenSearch's default `date` format
+        // (`strict_date_optional_time||epoch_millis`) accepts in `term` and `range` queries.
+        ScalarValue::TimestampSecond(Some(t), _) => Some(json!(t.checked_mul(1_000)?)),
+        ScalarValue::TimestampMillisecond(Some(t), _) => Some(json!(t)),
+        ScalarValue::TimestampMicrosecond(Some(t), _) => Some(json!(t.div_euclid(1_000))),
+        ScalarValue::TimestampNanosecond(Some(t), _) => Some(json!(t.div_euclid(1_000_000))),
+        ScalarValue::Date32(Some(d)) => Some(json!(i64::from(*d) * 86_400_000)),
+        _ => None, // NULLs, decimal/nested types → let DataFusion handle it
     }
 }
 
@@ -423,6 +430,31 @@ mod tests {
         // Under 3 points is not a polygon → not pushable (the UDF stub then fails closed).
         assert!(
             expr_to_query(&crate::udf::os_geo_polygon_udf().call(vec![col("position"), lit("[[1.0,2.0]]")])).is_none()
+        );
+    }
+
+    #[test]
+    fn temporal_literals_push_as_epoch_millis() {
+        let ts = Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some(1_704_164_645_000), Some("UTC".into())),
+            None,
+        );
+        assert_eq!(
+            expr_to_query(&col("when").gt(ts)),
+            Some(json!({ "range": { "when": { "gt": 1_704_164_645_000_i64 } } }))
+        );
+        let ns = Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(1_704_164_645_000_000_000), None),
+            None,
+        );
+        assert_eq!(
+            expr_to_query(&col("when").eq(ns)),
+            Some(json!({ "term": { "when": 1_704_164_645_000_i64 } }))
+        );
+        let day = Expr::Literal(ScalarValue::Date32(Some(19_724)), None); // 2024-01-02
+        assert_eq!(
+            expr_to_query(&col("when").gt_eq(day)),
+            Some(json!({ "range": { "when": { "gte": 1_704_153_600_000_i64 } } }))
         );
     }
 
