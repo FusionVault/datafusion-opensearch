@@ -3,7 +3,7 @@
 All notable changes to `datafusion-opensearch` are recorded here. The crate tracks the DataFusion
 major line (`0.x` ↔ DataFusion 54); a DataFusion major bump is a minor bump here.
 
-## Unreleased (0.2.0)
+## 0.2.0 — 2026-09-13
 
 ### Added
 - **Streaming scans.** A scan now pages through a scroll cursor (`OpenSearchExec`), emitting one
